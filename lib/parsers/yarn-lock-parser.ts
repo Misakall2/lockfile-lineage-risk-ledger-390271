@@ -1,0 +1,129 @@
+import * as yarnLockfileParser from '@yarnpkg/lockfile';
+
+import {
+  Dep,
+  Lockfile,
+  LockfileType,
+  ManifestDependencies,
+  ManifestFile,
+  PkgTree,
+  Scope,
+} from './index';
+import { InvalidUserInputError } from '../errors';
+import { DepMap, LockParserBase } from './lock-parser-base';
+import { config } from '../config';
+import { getComponentMetadataLabels } from '../component-metadata-labels';
+
+export type YarnLockFileTypes = LockfileType.yarn | LockfileType.yarn2;
+
+export interface YarnLock {
+  type: string;
+  object: YarnLockDeps;
+  dependencies?: YarnLockDeps;
+  lockfileType: YarnLockFileTypes;
+}
+
+export interface YarnLockDeps {
+  [depName: string]: YarnLockDep;
+}
+
+export interface YarnLockDep {
+  version: string;
+  // Component-metadata sources from the raw yarn v1 lockfile entry (SRI integrity + tarball URL).
+  resolved?: string;
+  integrity?: string;
+  dependencies?: {
+    [depName: string]: string;
+  };
+  optionalDependencies?: {
+    [depName: string]: string;
+  };
+}
+
+export class YarnLockParser extends LockParserBase {
+  constructor() {
+    super(LockfileType.yarn, config.YARN_TREE_SIZE_LIMIT);
+  }
+
+  public parseLockFile(lockFileContents: string): YarnLock {
+    try {
+      const yarnLock: YarnLock = yarnLockfileParser.parse(lockFileContents);
+      yarnLock.dependencies = yarnLock.object;
+      yarnLock.type = this.type;
+      return yarnLock;
+    } catch (e) {
+      throw new InvalidUserInputError(
+        `yarn.lock parsing failed with an error: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  public async getDependencyTree(
+    manifestFile: ManifestFile,
+    lockfile: Lockfile,
+    includeDev = false,
+    strictOutOfSync = true,
+    showNpmScope?: boolean,
+    includeComponentMetadata?: boolean,
+  ): Promise<PkgTree> {
+    const depTree = await super.getDependencyTree(
+      manifestFile,
+      lockfile,
+      includeDev,
+      strictOutOfSync,
+      showNpmScope,
+      includeComponentMetadata,
+    );
+
+    const meta = { lockfileVersion: 1, packageManager: 'yarn' };
+    const depTreeWithMeta = {
+      ...depTree,
+      meta: { ...depTree.meta, ...meta },
+    };
+
+    return depTreeWithMeta;
+  }
+
+  protected getDepMap(
+    lockfile: Lockfile,
+    resolutions?: ManifestDependencies,
+    showNpmScope?: boolean,
+    includeComponentMetadata?: boolean,
+  ): DepMap {
+    const yarnLockfile = lockfile as YarnLock;
+    const depMap: DepMap = {};
+
+    for (const [depName, dep] of Object.entries(yarnLockfile.object)) {
+      const subDependencies = Object.entries({
+        ...(dep.dependencies || {}),
+        ...(dep.optionalDependencies || {}),
+      });
+      const name = getName(depName);
+      depMap[depName] = {
+        labels: {
+          scope: Scope.prod,
+          ...(showNpmScope && { 'npm:scope': Scope.prod }),
+          ...(includeComponentMetadata &&
+            getComponentMetadataLabels({
+              id: `${name}@${dep.version}`,
+              integrity: dep.integrity,
+              resolved: dep.resolved,
+            })),
+        },
+        name,
+        requires: subDependencies.map(([key, ver]) => `${key}@${ver}`),
+        version: dep.version,
+      };
+    }
+
+    return depMap;
+  }
+
+  protected getDepTreeKey(dep: Dep): string {
+    return `${dep.name}@${dep.version}`;
+  }
+}
+
+function getName(depName: string) {
+  return depName.slice(0, depName.indexOf('@', 1));
+}

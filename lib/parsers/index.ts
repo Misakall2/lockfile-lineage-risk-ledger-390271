@@ -1,0 +1,243 @@
+import { PackageLock } from './package-lock-parser';
+import { YarnLock } from './yarn-lock-parser';
+import { InvalidUserInputError } from '../errors';
+import { Yarn2Lock } from './yarn2-lock-parser';
+import { loadYamlOrNull, parseJsonFile } from '../utils';
+
+export interface Dep {
+  name: string;
+  version: string;
+  dev?: boolean;
+}
+
+interface WorkspacesAlternateConfig {
+  packages?: string[];
+}
+
+export type ManifestDependencies = {
+  [dep: string]: string;
+};
+
+export type PeerDependenciesMeta = {
+  [dep: string]: { optional: boolean };
+};
+
+export interface ManifestFile {
+  name: string;
+  private?: string;
+  engines?: {
+    node?: string;
+  };
+  workspaces?: string[] | WorkspacesAlternateConfig;
+  dependencies?: ManifestDependencies;
+  devDependencies?: ManifestDependencies;
+  optionalDependencies?: ManifestDependencies;
+  peerDependencies?: ManifestDependencies;
+  peerDependenciesMeta?: PeerDependenciesMeta;
+  resolutions?: ManifestDependencies;
+  version?: string;
+  aliases?: Record<
+    string,
+    {
+      aliasName: string;
+      aliasTargetDepName: string;
+      semver: string;
+      version: string;
+    }
+  >;
+}
+
+// This is a copy/paste from https://github.com/snyk/dep-graph/blob/master/src/legacy/index.ts
+// and should be removed in favour of depgraph library interface
+
+export interface Alias {
+  aliasName: string;
+  aliasTargetDepName: string;
+  semver: string;
+  version: string;
+}
+export interface DepTreeDep {
+  name?: string; // shouldn't, but might happen
+  version?: string; // shouldn't, but might happen
+  dependencies?: {
+    [depName: string]: DepTreeDep;
+  };
+  labels?: {
+    [key: string]: string | Alias | undefined;
+    'npm:scope'?: 'prod' | 'dev' | 'unknown';
+    scope?: 'dev' | 'prod';
+    pruned?: 'cyclic' | 'true';
+    missingLockFileEntry?: 'true';
+    alias?: Alias;
+  };
+}
+
+export interface PkgTree extends DepTreeDep {
+  type?: string;
+  packageFormatVersion?: string;
+  dependencies: {
+    [depName: string]: DepTreeDep;
+  };
+  meta?: {
+    nodeVersion?: string;
+    lockfileVersion?: number;
+    packageManager?: string;
+  };
+  hasDevDependencies?: boolean;
+  cyclic?: boolean;
+  size?: number;
+}
+
+export enum Scope {
+  prod = 'prod',
+  dev = 'dev',
+}
+
+export enum LockfileType {
+  npm = 'npm',
+  npm7 = 'npm7',
+  yarn = 'yarn',
+  yarn2 = 'yarn2',
+  pnpm = 'pnpm',
+}
+
+export interface LockfileParser {
+  parseLockFile: (lockFileContents: string) => Lockfile;
+  getDependencyTree: (
+    manifestFile: ManifestFile,
+    lockfile: Lockfile,
+    includeDev?: boolean,
+    strictOutOfSync?: boolean,
+    showNpmScope?: boolean,
+    includeComponentMetadata?: boolean,
+  ) => Promise<PkgTree>;
+}
+
+export type Lockfile = PackageLock | YarnLock | Yarn2Lock;
+
+export function parseManifestFile(manifestFileContents: string): ManifestFile {
+  return parseJsonFile<ManifestFile>(manifestFileContents, 'package.json');
+}
+
+export function getTopLevelDeps({
+  targetFile,
+  includeDev,
+  includePeerDeps = false,
+  applyYarn2Resolutions = false,
+}: {
+  targetFile: ManifestFile;
+  includeDev: boolean;
+  includePeerDeps?: boolean;
+  applyYarn2Resolutions?: boolean;
+}): Dep[] {
+  let dependencies: Dep[] = [];
+
+  const dependenciesIterator = Object.entries({
+    ...targetFile.dependencies,
+    ...(includeDev ? targetFile.devDependencies : null),
+    ...(targetFile.optionalDependencies || {}),
+  });
+
+  for (const [name, version] of dependenciesIterator) {
+    dependencies.push({
+      dev:
+        includeDev && targetFile.devDependencies
+          ? !!targetFile.devDependencies[name]
+          : false,
+      name,
+      version,
+    });
+  }
+
+  if (includePeerDeps && targetFile.peerDependencies) {
+    for (const [name, version] of Object.entries(targetFile.peerDependencies)) {
+      if (targetFile?.peerDependenciesMeta?.[name]?.optional) {
+        continue;
+      }
+      dependencies.push({
+        name,
+        version,
+      });
+    }
+  }
+
+  if (applyYarn2Resolutions && targetFile.resolutions) {
+    const resMap = new Map(
+      Object.entries(targetFile.resolutions).map(([resName, resVersion]) => {
+        let key = resName.replace(`${targetFile.name}/`, '');
+        // Patch resolution keys use the format "name@npm:range" (e.g. "papaparse@npm:^5.3.0").
+        // Extract the bare package name so it can be matched against dep.name.
+        // The [^/] guard avoids matching scoped resolutions that target a sub-dependency
+        // (e.g. "debug@npm:4.3.2/ms"), which are handled separately in findResolutions.
+        const npmPrefixMatch = key.match(/^(.+)@npm:[^/]+$/);
+        if (npmPrefixMatch) {
+          key = npmPrefixMatch[1];
+        }
+        return [key, resVersion];
+      }),
+    );
+
+    dependencies = dependencies.map((dep) =>
+      resMap.has(dep.name) ? { ...dep, version: resMap.get(dep.name)! } : dep,
+    );
+  }
+  return dependencies;
+}
+
+export function createDepTreeDepFromDep(
+  dep: Dep,
+  showNpmScope?: boolean,
+): DepTreeDep {
+  return {
+    labels: {
+      scope: dep.dev ? Scope.dev : Scope.prod,
+      ...(showNpmScope && { 'npm:scope': dep.dev ? Scope.dev : Scope.prod }),
+    },
+    name: dep.name,
+    version: dep.version,
+  };
+}
+
+export function getYarnWorkspaces(targetFile: string): string[] | false {
+  try {
+    const packageJson: ManifestFile = parseManifestFile(targetFile);
+    if (!!packageJson.workspaces && !!packageJson.private) {
+      if (Array.isArray(packageJson.workspaces)) {
+        return packageJson.workspaces;
+      }
+      if (
+        'packages' in packageJson.workspaces &&
+        Array.isArray(packageJson.workspaces.packages)
+      ) {
+        return packageJson.workspaces.packages;
+      }
+    }
+    return false;
+  } catch (e) {
+    throw new InvalidUserInputError(
+      'package.json parsing failed with ' + `error ${(e as Error).message}`,
+    );
+  }
+}
+
+export function getPnpmWorkspaces(workspacesYamlFile: string): string[] {
+  try {
+    // js-yaml 4 returned a nullish value for empty (or comment-only)
+    // documents where js-yaml 5 throws; loadYamlOrNull preserves the old
+    // behavior of falling through to the default below.
+    const rawPnpmWorkspacesYaml = loadYamlOrNull<any>(workspacesYamlFile);
+
+    if (rawPnpmWorkspacesYaml && rawPnpmWorkspacesYaml.packages) {
+      if (Array.isArray(rawPnpmWorkspacesYaml.packages)) {
+        return rawPnpmWorkspacesYaml.packages;
+      }
+    }
+    // By default, all packages of all subdirectories are included.
+    // https://pnpm.io/pnpm-workspace_yaml
+    return ['*'];
+  } catch (e) {
+    throw new InvalidUserInputError(
+      `pnpm-workspace.yaml parsing failed with error ${(e as Error).message}`,
+    );
+  }
+}

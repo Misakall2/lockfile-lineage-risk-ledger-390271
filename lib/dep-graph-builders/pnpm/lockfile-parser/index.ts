@@ -1,0 +1,64 @@
+import { PnpmLockfileParser } from './lockfile-parser';
+import { LockfileV6Parser } from './lockfile-v6';
+import { LockfileV5Parser } from './lockfile-v5';
+import { LockfileV9Parser } from './lockfile-v9';
+import { PnpmWorkspaceArgs } from '../../types';
+import { OpenSourceEcosystems } from '@snyk/error-catalog-nodejs-public';
+import {
+  NodeLockfileVersion,
+  extractPnpmMainDocument,
+  loadYamlMappingOrThrow,
+} from '../../../utils';
+
+export function getPnpmLockfileParser(
+  pnpmLockContent: string | undefined,
+  lockfileVersion?: NodeLockfileVersion,
+  workspaceArgs?: PnpmWorkspaceArgs,
+): PnpmLockfileParser {
+  // In case of no dependencies, pnpm@7 (lokfile version 5)
+  // does not create a lockfile at `pnpm install`
+  // so if there is no lockfile content, default to lockfile version 5
+  if (!pnpmLockContent) {
+    return new LockfileV5Parser(pnpmLockContent, workspaceArgs);
+  }
+  // pnpm 11+ may prepend an env/config document to pnpm-lock.yaml;
+  // only the dependency document is parsed. An env-only lockfile has no
+  // dependency document and is treated the same as no lockfile.
+  const mainDocument = extractPnpmMainDocument(pnpmLockContent);
+  if (!mainDocument) {
+    return new LockfileV5Parser(undefined, workspaceArgs);
+  }
+  const rawPnpmLock = loadYamlMappingOrThrow<any>(
+    mainDocument,
+    'pnpm-lock.yaml',
+  );
+  const version = rawPnpmLock.lockfileVersion;
+  const versionStr = typeof version === 'string' ? version : '';
+
+  if (
+    lockfileVersion === NodeLockfileVersion.PnpmLockV5 ||
+    versionStr.startsWith('5')
+  ) {
+    return new LockfileV5Parser(rawPnpmLock, workspaceArgs);
+  }
+
+  if (
+    lockfileVersion === NodeLockfileVersion.PnpmLockV6 ||
+    versionStr.startsWith('6')
+  ) {
+    return new LockfileV6Parser(rawPnpmLock, workspaceArgs);
+  }
+
+  if (
+    lockfileVersion === NodeLockfileVersion.PnpmLockV9 ||
+    versionStr.startsWith('9')
+  ) {
+    return new LockfileV9Parser(rawPnpmLock, workspaceArgs);
+  }
+
+  throw new OpenSourceEcosystems.PnpmUnsupportedLockfileVersionError(
+    `The pnpm-lock.yaml lockfile version ${
+      lockfileVersion ?? version
+    } is not supported`,
+  );
+}

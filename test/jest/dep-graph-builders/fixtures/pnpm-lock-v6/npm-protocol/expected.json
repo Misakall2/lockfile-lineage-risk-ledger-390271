@@ -1,0 +1,46 @@
+{
+  "schemaVersion": "1.3.0",
+  "pkgManager": {
+    "name": "pnpm"
+  },
+  "pkgs": [
+    {
+      "id": "test3@undefined",
+      "info": {
+        "name": "test3",
+        "version": "undefined"
+      }
+    },
+    {
+      "id": "lodash@4.17.21",
+      "info": {
+        "name": "lodash",
+        "version": "4.17.21"
+      }
+    }
+  ],
+  "graph": {
+    "rootNodeId": "root-node",
+    "nodes": [
+      {
+        "nodeId": "root-node",
+        "pkgId": "test3@undefined",
+        "deps": [
+          {
+            "nodeId": "lodash@4.17.21"
+          }
+        ]
+      },
+      {
+        "nodeId": "lodash@4.17.21",
+        "pkgId": "lodash@4.17.21",
+        "deps": [],
+        "info": {
+          "labels": {
+            "scope": "prod"
+          }
+        }
+      }
+    ]
+  }
+}

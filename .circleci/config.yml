@@ -1,0 +1,258 @@
+version: 2.1
+
+orbs:
+  # Snyk-owned orbs: track the latest release of the major version
+  prodsec: snyk/prodsec-orb@1
+  # Third-party orbs: always pin an exact version
+  win: circleci/windows@5.1.1
+
+filters_branches_ignore_main: &filters_branches_ignore_main
+  filters:
+    branches:
+      ignore:
+        - main
+
+defaults: &defaults
+  parameters:
+    node_version:
+      type: string
+      default: ""
+  working_directory: ~/nodejs-lockfile-parser
+
+windows_defaults: &windows_defaults
+  environment:
+    npm_config_loglevel: silent
+  executor:
+    name: win/default
+
+test_matrix: &test_matrix
+  node_version: ['22', '24', '26']
+
+commands:
+  install_deps:
+    description: Install dependencies
+    steps:
+      - checkout
+      - run:
+          name: Use snyk-main npmjs user
+          command: echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" >> .npmrc
+      - run:
+          name: Install dependencies
+          command: npm install
+  install_node_npm:
+    description: Install correct Node version
+    parameters:
+      node_version:
+        type: string
+        default: ""
+    steps:
+      - run:
+          name: Install correct version of Node
+          # nvm-windows on the Windows Server 2022 image crashes on partial versions like "20.20", so resolve the full version first.
+          command: |
+            $requested = "<< parameters.node_version >>"
+            $releases = Invoke-RestMethod https://nodejs.org/dist/index.json
+            $match = $releases | Where-Object { $_.version -eq "v$requested" -or $_.version -like "v$requested.*" } | Select-Object -First 1
+            if (-not $match) { throw "No Node.js release matches $requested" }
+            [string]$version = $match.version.TrimStart('v')
+            Write-Host "Resolved Node.js $requested to $version"
+            Set-Content -Path "$HOME\.node-version-resolved" -Value $version
+            nvm install $version
+      - run:
+          name: Use correct version of Node
+          command: |
+            $version = (Get-Content "$HOME\.node-version-resolved").Trim()
+            nvm use $version
+  show_node_version:
+    description: Log Node and npm version
+    steps:
+      - run:
+          name: Node version
+          command: node --version
+      - run:
+          name: NPM version
+          command: npm --version
+
+jobs:
+  security-scans:
+    resource_class: small
+    <<: *defaults
+    docker:
+      - image: cimg/node:<< parameters.node_version >>
+    steps:
+      - show_node_version
+      - checkout
+      - attach_workspace:
+          at: ~/nodejs-lockfile-parser
+      - install_deps
+      - prodsec/security_scans:
+          mode: auto
+          open-source-additional-arguments: --exclude=test
+          iac-scan: disabled
+  lint:
+    <<: *defaults
+    docker:
+      - image: cimg/node:<< parameters.node_version >>
+    steps:
+      - show_node_version
+      - checkout
+      - attach_workspace:
+          at: ~/nodejs-lockfile-parser
+      - install_deps
+      - run:
+          name: Run lint
+          command: npm run lint
+
+  test-windows-jest:
+    <<: *defaults
+    <<: *windows_defaults
+    steps:
+      - run: git config --global core.autocrlf false
+      - install_node_npm:
+          node_version: << parameters.node_version >>
+      - checkout
+      - attach_workspace:
+          at: ~/nodejs-lockfile-parser
+      - install_deps
+      - show_node_version
+      - run:
+          name: Run tests
+          command: npm run test:jest
+
+  test-windows-tap:
+    <<: *defaults
+    <<: *windows_defaults
+    steps:
+      - run: git config --global core.autocrlf false
+      - install_node_npm:
+          node_version: << parameters.node_version >>
+      - checkout
+      - attach_workspace:
+          at: ~/nodejs-lockfile-parser
+      - install_deps
+      - show_node_version
+      - run:
+          name: Run tests
+          command: npm run unit-test
+
+  test-unix-jest:
+    <<: *defaults
+    docker:
+      - image: cimg/node:<< parameters.node_version >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/nodejs-lockfile-parser
+      - install_deps
+      - show_node_version
+      - run:
+          name: Run tests
+          command: npm run test:jest
+
+  test-unix-tap:
+    <<: *defaults
+    docker:
+      - image: cimg/node:<< parameters.node_version >>
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/nodejs-lockfile-parser
+      - install_deps
+      - show_node_version
+      - run:
+          name: Run tests
+          command: npm run unit-test
+
+  release:
+    <<: *defaults
+    docker:
+      - image: cimg/node:<< parameters.node_version >>
+    resource_class: small
+    steps:
+      - checkout
+      - run: sudo npm i -g semantic-release@25 @semantic-release/exec pkg
+      - run:
+          name: Install NPM packages
+          command: npm i
+      - run:
+          name: Publish to GitHub
+          command: |
+            export NPM_ID_TOKEN=$(circleci run oidc get --claims '{"aud": "npm:registry.npmjs.org"}')
+            semantic-release
+
+workflows:
+  version: 2
+  test_and_release:
+    jobs:
+      - prodsec/secrets-scan:
+          name: Scan repository for secrets
+          context:
+            - snyk-bot-slack
+            - prodsec-orb-runtime
+          channel: snyk-vuln-alerts-sca-scanners
+          filters:
+            branches:
+              ignore:
+                - main
+      - security-scans:
+          name: Security Scans
+          node_version: "24"
+          context:
+            - engines_sca-scanners
+            - nodejs-install
+            - prodsec-orb-runtime
+      - lint:
+          name: Lint
+          context: nodejs-install
+          node_version: "24"
+          <<: *filters_branches_ignore_main
+      - test-windows-jest:
+          matrix:
+            alias: test-windows-jest
+            parameters:
+              <<: *test_matrix
+          name: Windows Tests (Jest) for Node=<< matrix.node_version >> support
+          context: nodejs-install
+          requires:
+            - Lint
+          <<: *filters_branches_ignore_main
+      - test-windows-tap:
+          matrix:
+            alias: test-windows-tap
+            parameters:
+              <<: *test_matrix
+          name: Windows Tests (Tap) for Node=<< matrix.node_version >> support
+          context: nodejs-install
+          requires:
+            - Lint
+          <<: *filters_branches_ignore_main
+      - test-unix-jest:
+          matrix:
+            alias: test-unix-jest
+            parameters:
+              <<: *test_matrix
+          name: Unix Tests (Jest) for Node=<< matrix.node_version >> support
+          context: nodejs-install
+          requires:
+            - Lint
+          <<: *filters_branches_ignore_main
+      - test-unix-tap:
+          matrix:
+            alias: test-unix-tap
+            parameters:
+              <<: *test_matrix
+          name: Unix Tests (Tap) for Node=<< matrix.node_version >> support
+          context: nodejs-install
+          requires:
+            - Lint
+          <<: *filters_branches_ignore_main
+      - release:
+          name: Release
+          context:
+            - nodejs-install
+            - github-release
+          node_version: "24"  # npm 11+ (Node 24) is needed for OIDC trusted publishing
+          filters:
+            branches:
+              only:
+                - main
